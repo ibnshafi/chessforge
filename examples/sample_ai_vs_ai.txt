@@ -1,0 +1,7 @@
+Depth 2 AI-vs-AI sample from the starting position:
+
+g1f3 g8f6 b1c3 b8c6 d2d4 d7d5 d1d3 d8d6 e2e4 e7e5 d4e5 c6e5 f3e5 d6e5 c3d5 e5e4 d3e4 f6e4 d5c7 e8e7 c7a8 c8g4 f2f3 g4f5 f3e4 f5e4 c1g5 f7f6 g5e3 e4c2 a1c1 c2e4 c1c7 e7e6 e3a7 f8b4 e1f2 h8a8
+
+Final FEN after the sample:
+
+r7/BpR3pp/4kp2/8/1b2b3/8/PP3KPP/5B1R w - - 0 20

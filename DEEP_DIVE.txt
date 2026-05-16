@@ -1,0 +1,734 @@
+ChessForge Deep Dive (No External Chess Libraries)
+==================================================
+
+Location
+--------
+Project root: C:\Users\shehe\OneDrive\Documents\New project\
+
+Purpose
+-------
+ChessForge is a complete chess system implemented from scratch:
+
+1. A rules-accurate chess position/state model (FEN-compatible).
+2. Fully legal move generation (pseudo-legal generation + king-safety legality filtering).
+3. Game outcome detection:
+   - check / checkmate / stalemate
+   - threefold repetition
+   - 50-move rule
+   - insufficient material (basic FIDE cases)
+4. A deterministic search-based AI:
+   - negamax minimax with alpha-beta pruning
+   - iterative deepening
+   - quiescence search
+   - transposition table (hash-based memoization)
+   - tactical move ordering
+5. Interfaces:
+   - interactive CLI (human-human, human-AI, AI-AI)
+   - minimal UCI protocol loop (GUI integration)
+6. Validation tooling:
+   - perft and perft-divide framework
+   - unit tests for rules + perft + search legality
+
+The core design goal is correctness and extensibility with clean separation:
+rules/state/moves are in core; evaluation is separate; search is separate; interfaces are on top.
+
+
+Project File Map
+----------------
+
+chessforge\constants.py
+  - Board indexing and square helpers.
+  - Piece encoding constants and castling constants.
+
+chessforge\move.py
+  - Move representation and UCI formatting.
+
+chessforge\core.py
+  - Position (immutable game state), FEN parsing/printing.
+  - Attack detection, pseudo-legal move generation, legal move filtering.
+  - Special moves: castling, en passant, promotion.
+  - Game-status detection (mate/stalemate/draw conditions).
+  - Zobrist hashing + repetition history.
+  - Perft framework.
+
+chessforge\evaluation.py
+  - Static evaluation function.
+  - Matrix-based (piece-square tables) terms + mobility + king safety + bishop pair.
+
+chessforge\search.py
+  - Negamax alpha-beta search with iterative deepening.
+  - Quiescence search for tactical stability.
+  - Transposition table storing bounds/exact values.
+  - Deterministic move ordering.
+
+chessforge\cli.py
+  - Playable terminal interface.
+  - Human vs AI, AI vs AI, and debugging commands (perft/divide/legal/board/etc).
+
+chessforge\uci.py
+  - Minimal UCI loop for chess GUI integration.
+
+tests\test_perft.py
+  - Canonical perft regression tests.
+
+tests\test_rules.py
+  - Rule-specific regressions (castling edge cases, EP discovered-check legality, promotions, mate/stalemate, repetition, 50-move).
+
+tests\test_search.py
+  - Ensures search returns legal moves and handles terminal positions.
+
+examples\ai_vs_ai.py
+  - Example runner for a deterministic AI-vs-AI sample.
+
+examples\sample_ai_vs_ai.txt
+  - One recorded AI-vs-AI move list and final FEN.
+
+README.md / pyproject.toml
+  - Project usage notes and packaging/entrypoints.
+
+
+Core Data Representations (Fundamentals)
+---------------------------------------
+
+1) Board indexing (0..63, a1==0)
+   - The board is indexed by file and rank:
+     file: a..h -> 0..7
+     rank: 1..8 -> 0..7
+   - square_index = rank_index * 8 + file_index
+   - a1 is (file=0, rank=0) -> 0
+   - h8 is (file=7, rank=7) -> 63
+   Implementation: chessforge\constants.py
+     - square(file_index, rank_index)
+     - file_of(square_index)
+     - rank_of(square_index)
+     - square_name(square_index)
+     - parse_square("e4")
+
+2) Piece encoding
+   - Each square contains an int:
+     0      : empty
+     +type  : white piece
+     -type  : black piece
+   - Piece types:
+     PAWN=1, KNIGHT=2, BISHOP=3, ROOK=4, QUEEN=5, KING=6
+   - Helpers:
+     - color_of(piece) -> WHITE, BLACK, or EMPTY
+     - piece_type(piece) -> abs(piece)
+   Implementation: chessforge\constants.py
+
+3) Move representation
+   - Moves are stored as a small immutable dataclass:
+     from_sq (0..63)
+     to_sq   (0..63)
+     promotion (0 or one of KNIGHT/BISHOP/ROOK/QUEEN)
+     is_en_passant (bool)
+     is_castling   (bool)
+   - The engine uses UCI as the user-facing move format:
+     "e2e4", "g1f3", "e7e8q", etc.
+   - NOTE: UCI does not explicitly encode EP/castling flags. The engine infers
+     those by matching against current legal moves (Position.parse_uci_move()).
+   Implementation: chessforge\move.py and chessforge\core.py
+
+4) Position representation
+   - Position is an immutable dataclass that carries:
+     board: tuple[int, ...] length 64 (immutable)
+     turn: WHITE or BLACK
+     castling: bitmask KQkq
+     ep_square: en-passant target square or -1
+     halfmove_clock: for 50-move rule (>=0)
+     fullmove_number: move count (>=1)
+     zobrist_hash: 64-bit key for transposition/repetition
+     history: tuple of zobrist hashes, for repetition detection
+   Implementation: chessforge\core.py Position
+
+   Why immutable positions:
+   - Search and perft generate huge numbers of child states.
+   - Immutability avoids accidental state corruption.
+   - Each transition is a pure function: Position + Move -> new Position.
+
+   Performance note:
+   - For hot paths (legal-move filtering, perft recursion, search internal nodes),
+     there is a fast internal constructor Position._trusted(...) which bypasses
+     expensive invariants. This is used only for engine-internal transient nodes.
+   - Full "public" moves compute hashes and optionally update history.
+
+
+FEN Support (Parsing and Printing)
+---------------------------------
+FEN format has 6 fields:
+  1) piece placement  (8 ranks separated by '/')
+  2) side to move     ('w' or 'b')
+  3) castling rights  ('KQkq' subset or '-')
+  4) en passant       (square or '-')
+  5) halfmove clock
+  6) fullmove number
+
+Implementation: chessforge\core.py
+  - Position.from_fen(fen: str) -> Position
+  - Position.to_fen() -> str
+
+Validation and defensiveness:
+  - Ensures 8 ranks, each rank totals 8 squares.
+  - Ensures side-to-move is w/b.
+  - Ensures castling flags are valid and non-duplicated.
+  - Ensures numeric counters parse correctly and have sane bounds.
+  - Ensures exactly one king per side exists (not a full legality test, but a strong invariant).
+
+
+Legal Move Generation: Overall Structure
+----------------------------------------
+The move generator is "legal" (not just pseudo-legal):
+
+Step A: generate pseudo-legal moves (piece moves without checking self-check).
+Step B: for each pseudo-legal move:
+        apply move to obtain a child position
+        reject it if it leaves the mover's king in check
+
+Implementation: chessforge\core.py
+  - Position.generate_pseudo_legal_moves(...)
+  - Position.legal_moves()
+  - Position.is_in_check(...)
+  - Position.is_square_attacked(...)
+
+This design is intentionally simple and robust:
+  - It automatically handles pins and discovered checks.
+  - It correctly rejects:
+    - moving pinned pieces that expose king
+    - en passant captures that open a rook/bishop line to own king
+    - king moves into attacked squares
+    - castling through check or into check
+
+The cost is additional child generation, but for a beginner-intermediate engine
+this is a reasonable tradeoff. The code also includes performance optimizations
+(trusted transient positions) to keep this filtering fast enough.
+
+
+Attack Detection (The Legality Primitive)
+-----------------------------------------
+To decide whether a king is in check after a candidate move, we must test whether
+the king's square is attacked by the opponent.
+
+Implementation: chessforge\core.py
+  - Position.is_square_attacked(square_index, by_color)
+
+Attacks tested:
+  1) Pawn attacks:
+     - White pawns attack (file +/- 1, rank + 1)
+     - Black pawns attack (file +/- 1, rank - 1)
+     The function checks the reverse direction: given a target square, it checks
+     whether a pawn of by_color exists on the pawn-source squares.
+
+  2) Knight attacks:
+     - Uses KNIGHT_DELTAS (8 L-shaped offsets) from constants.py
+
+  3) King adjacency attacks:
+     - Uses KING_DELTAS (8 neighbors) for completeness
+
+  4) Sliding piece attacks:
+     - Bishops / queens along diagonals
+     - Rooks / queens along ranks/files
+     The function ray-traces until it hits a piece or the board edge.
+
+Important detail:
+  - Attack detection is used for castling legality as well: the king cannot
+    castle out of check, through check, or into check.
+
+
+Pseudo-Legal Move Generation: Piece-by-Piece
+--------------------------------------------
+
+Implementation: chessforge\core.py
+  - Position.generate_pseudo_legal_moves(...)
+  - Position._pawn_moves(...)
+  - Position._jump_moves(...) for knight/king
+  - Position._slide_moves(...) for bishop/rook/queen
+  - Position._king_moves(...) also adds castling
+
+PAWNS
+  - Single push if empty.
+  - Double push from starting rank if both squares empty.
+  - Captures diagonally if enemy piece.
+  - Promotions on last rank: generates 4 moves (n,b,r,q).
+  - En passant:
+    - If target square equals ep_square, a pawn can capture EP if the captured pawn
+      exists on the square behind the target.
+    - This generator yields Move(is_en_passant=True) for EP candidates.
+    - Legality filter later rejects EP if it exposes own king (discovered check).
+
+KNIGHTS
+  - 8 jump destinations using KNIGHT_DELTAS.
+  - Destination is valid if empty or contains opponent non-king piece.
+
+BISHOPS / ROOKS / QUEENS
+  - Sliding rays with direction vectors.
+  - Stop at first occupied square:
+    - If it is opponent non-king: can capture
+    - If friendly: blocked
+  - Capturing the king is explicitly disallowed.
+
+KING (non-castling moves)
+  - Uses KING_DELTAS.
+  - Later legality filter ensures king does not move into attack.
+
+CASTLING
+  - Generated inside _king_moves for e1/e8 kings only.
+  - Kingside:
+    - Requires castling right bit (K/k).
+    - Requires king on e1/e8 and rook on h1/h8.
+    - Squares between are empty (f and g squares).
+    - Squares e, f, g are NOT attacked by enemy.
+  - Queenside:
+    - Requires castling right bit (Q/q).
+    - King on e1/e8 and rook on a1/a8.
+    - Squares between are empty (b, c, d squares).
+    - Squares e, d, c are NOT attacked by enemy.
+
+Note on chess variants:
+  - This engine implements standard FIDE castling (not Chess960).
+
+
+Applying Moves (State Transition)
+--------------------------------
+Implementation: chessforge\core.py
+  - Position.make_move(move, validate=True, record_history=True)
+  - Position._make_move_unchecked(move, record_history, compute_hash)
+  - Position._updated_castling_rights(...)
+  - Position._move_rook_for_castle(...)
+
+Two entrypoints:
+  - make_move(validate=True) is the safe "public" API.
+    It checks the move against current legal moves (by UCI string) and raises if illegal.
+  - _make_move_unchecked is an internal transition function used by:
+    - legality filtering
+    - perft
+    - search
+    It assumes the caller provides a semantically correct Move object (including flags).
+
+Move application details:
+  1) Remove piece from from_sq.
+  2) Handle en passant:
+     - Remove captured pawn from behind the EP target square.
+     - Validate that the captured pawn is actually present.
+  3) Place moving piece:
+     - If promotion != 0, place promoted piece instead of pawn.
+  4) Handle castling:
+     - Move rook from corner to its castled square.
+     - Validate rook existence.
+  5) Update castling rights:
+     - King move clears both rights for that side.
+     - Rook move clears that rook's side right.
+     - Capturing a rook on a corner clears opponent right.
+  6) Update ep_square:
+     - Only set when a pawn advances two squares; ep_square becomes the passed-over square.
+  7) Update halfmove clock:
+     - Reset to 0 after pawn move or capture.
+     - Otherwise increment by 1.
+  8) Update fullmove number:
+     - Increment after Black has moved (i.e., when side == BLACK).
+  9) Update turn.
+ 10) Hash/history:
+     - If record_history is True, compute zobrist hash and append to history.
+     - If record_history is False and compute_hash is False, hash may be 0 for transient nodes.
+
+
+Zobrist Hashing (Repetition and Transposition Keys)
+---------------------------------------------------
+Zobrist hashing assigns a random 64-bit key to each (piece, square) combination,
+and XORs them together to build a position key, plus extra keys for:
+  - castling rights state
+  - en-passant file (only when meaningful)
+  - side-to-move
+
+Implementation: chessforge\core.py
+  - _splitmix64(...) pseudo-random generator
+  - _build_zobrist() builds deterministic tables from a fixed seed
+  - compute_zobrist_hash(board, turn, castling, ep_square)
+  - _effective_ep_square(...) (important detail)
+
+Important detail: "Effective" en passant square
+  - FEN can contain an ep target even when no ep capture is possible.
+  - For repetition detection and transposition correctness, the hash should not
+    differ just because of a meaningless EP square.
+  - _effective_ep_square checks whether a pawn of the side to move exists that could
+    actually capture onto the ep square. If not, ep is ignored in hashing.
+  - This matches standard engine practice.
+
+
+Draw / Terminal State Detection
+-------------------------------
+Implementation: chessforge\core.py
+  - Position.status() -> GameStatus
+  - Position.is_threefold_repetition()
+  - Position.is_fifty_move_rule()
+  - Position.is_insufficient_material()
+
+1) Checkmate and stalemate
+  - If legal_moves() returns empty:
+    - If side to move is in check -> checkmate (winner is the opponent).
+    - Otherwise -> stalemate.
+
+2) Threefold repetition
+  - Position.history stores each zobrist hash after each move.
+  - repetition_count counts matching hashes.
+  - is_threefold_repetition is True if count >= 3.
+  - status() reports draw for threefold.
+
+3) 50-move rule
+  - halfmove_clock increments on non-pawn, non-capture moves.
+  - When halfmove_clock >= 100 plies (50 moves each side), draw.
+
+4) Insufficient material (basic cases)
+  - K vs K -> draw.
+  - K + (B or N) vs K -> draw.
+  - K + B vs K + B with bishops on same color -> draw.
+
+Note:
+  - There are deeper insufficient-material edge cases in official rules
+    (rare or contrived configurations), but the implemented set covers the
+    standard practical cases and is regression-tested.
+
+
+Perft (Move Generator Verification)
+-----------------------------------
+Perft counts the number of leaf nodes at a given depth when expanding legal moves.
+It is a standard correctness tool: a single wrong move, missing move, or illegal
+move usually changes the leaf count.
+
+Implementation: chessforge\core.py
+  - perft(position, depth) -> int
+  - perft_divide(position, depth) -> dict[uci_move, nodes]
+
+Characteristics:
+  - Uses legal_moves() (so it's validating legality, not pseudo-legal).
+  - Uses the internal unchecked move application for speed, without updating history,
+    because perft is about legal move expansion, not repetition history.
+
+Regression positions tested:
+  - Start position: depth 1..3
+  - Kiwipete: depth 1..3 (classic castling/EP/pins stress test)
+  - An endgame/EP stress position: depth 1..3
+  Tests: tests\test_perft.py
+
+
+Evaluation (Static Scoring)
+---------------------------
+Evaluation returns a centipawn score:
+  positive -> favors White
+  negative -> favors Black
+
+Implementation: chessforge\evaluation.py
+  - evaluate(position) -> int
+
+Concepts used in eval:
+
+1) Material values
+  - Basic piece weights in centipawns.
+  - constants.py PIECE_VALUES:
+    pawn=100, knight=320, bishop=330, rook=500, queen=900
+
+2) Piece-square tables (PST) as matrices
+  - 8x8 integer matrices per piece type.
+  - Stored from White's perspective and mirrored for Black.
+  - This is literally using matrices as requested:
+    each PST is a matrix that is indexed by (rank, file) to provide a positional bonus.
+  - PSTs are defined for pawn/knight/bishop/rook/queen.
+
+3) King PST blending (middlegame vs endgame)
+  - Two king matrices: KING_MIDDLEGAME_PST and KING_ENDGAME_PST.
+  - The eval computes an endgame weight in [0,1] based on remaining non-pawn material.
+  - King PST uses linear interpolation:
+      king_score = middle*(1-w) + end*w
+    This is a matrix-based interpolation concept.
+
+4) Bishop pair bonus
+  - If a side has 2+ bishops, add a bonus.
+
+5) Mobility scoring
+  - Counts pseudo-legal moves for white and black and uses a small scaled delta.
+  - This approximates initiative and space without doing deep tactics.
+
+6) King safety heuristics
+  - Pawn shield: friendly pawns in front of the king add safety points.
+  - Attack pressure: counts attacked squares around king's neighborhood.
+
+Why separate evaluation:
+  - Enables swapping evaluation strategies without rewriting rules or search.
+  - Search calls evaluate(position) through a small wrapper to interpret it from side-to-move.
+
+
+Search (AI) System: Negamax Alpha-Beta With Enhancements
+-------------------------------------------------------
+Implementation: chessforge\search.py
+  - SearchEngine.search(position, config) -> SearchResult
+  - SearchConfig and SearchResult data models
+
+Core algorithm: negamax
+  - Standard minimax can be written as a negamax recursion:
+    score(position) = max over moves of (-score(child_position))
+  - Alpha-beta pruning maintains an interval [alpha, beta]:
+    alpha = best score found so far for current player
+    beta  = best score the opponent can force (upper bound)
+    If alpha >= beta, remaining moves cannot improve the result and can be pruned.
+
+SearchConfig fields:
+  - max_depth: maximum ply depth searched.
+  - time_limit: soft time limit in seconds (None means no time cutoff).
+  - use_quiescence: whether to use quiescence at depth 0.
+  - max_quiescence_depth: limits capture-only extension.
+  - use_transposition_table: whether to store/look up TT entries.
+  - log: prints UCI-like info lines for debugging.
+
+Iterative deepening:
+  - search() loops depth 1..max_depth.
+  - After each completed depth, it keeps the best move/score found.
+  - If time runs out during a later depth, it returns the best completed depth result.
+  - This allows:
+    - better move ordering (TT best move from previous depths)
+    - graceful cutoff under time limits
+
+Quiescence search:
+  - At depth==0, a raw static evaluation can be unstable due to "horizon effect":
+    the eval might not see a hanging queen because the capture is one ply away.
+  - Quiescence extends the search for "noisy" positions by exploring only:
+    - captures
+    - promotions
+  - It uses alpha-beta as well, but only over tactical moves, up to max_quiescence_depth.
+
+Transposition table (TT):
+  - A dict keyed by zobrist_hash.
+  - Each entry stores:
+    - depth searched
+    - score
+    - flag: EXACT, LOWER_BOUND, UPPER_BOUND
+    - best_move: Move
+  - On lookup:
+    - If entry.depth >= current depth, the stored info can tighten alpha/beta or return exact.
+  - On store:
+    - EXACT if the node was searched without failing high/low.
+    - LOWER_BOUND if score >= beta (fail-high).
+    - UPPER_BOUND if score <= original_alpha (fail-low).
+
+Move ordering:
+  - The search sorts moves to improve pruning.
+  - Heuristics used:
+    - captures scored higher (MVV/LVA-like score from Position.move_score_hint).
+    - promotions scored higher.
+    - castling scored slightly higher.
+    - TT move (if available) gets a huge bonus to be tried first.
+    - "gives check" gets bonus: tests child.is_in_check(child.turn).
+  - Tie-breaker: UCI string sort, making behavior deterministic.
+
+Mate scoring:
+  - Uses a large constant MATE_SCORE.
+  - If no legal moves and in check: return -MATE_SCORE + ply
+    so mates closer are preferred.
+
+Time control:
+  - search has a soft deadline.
+  - _check_timeout samples periodically based on node counter bits.
+  - On timeout it raises SearchTimeout internally and the caller returns best completed depth.
+
+Determinism:
+  - Zobrist tables are built from a fixed seed.
+  - Move ordering uses deterministic scoring and deterministic tie-break.
+  - No randomness is used in search.
+
+
+CLI Interface (Playable Terminal Application)
+--------------------------------------------
+Implementation: chessforge\cli.py
+
+Modes:
+  - human-human: both sides use input commands.
+  - human-ai: one side is human, the other is AI.
+  - ai-ai: both sides are AI; can cap plies for demos/tests.
+
+Human commands in CLI:
+  - A UCI move like "e2e4" executes that move if legal.
+  - "legal": prints legal moves in UCI format.
+  - "fen": prints current position FEN.
+  - "board": prints an ASCII board plus state metadata.
+  - "eval": prints static evaluation (centipawns).
+  - "perft N": runs perft at depth N from current position.
+  - "divide N": perft-divide at depth N.
+  - "undo": undo one ply (uses a stack of Positions).
+  - "quit": exit.
+
+AI move execution:
+  - SearchEngine.search(...) is called with depth/time arguments.
+  - It prints a line containing best move, depth, score, node count, and PV.
+
+Why a stack:
+  - Allows undo without needing a complex reversible move system.
+  - Positions are immutable, so prior states remain correct.
+
+
+UCI Interface
+-------------
+Implementation: chessforge\uci.py
+
+Supported UCI commands:
+  - uci
+  - isready
+  - ucinewgame
+  - position startpos [moves ...]
+  - position fen <6-field-fen> [moves ...]
+  - go depth N
+  - go movetime MS
+  - stop (returns a null bestmove)
+  - d (debug: prints board)
+  - quit
+
+Behavior details:
+  - "go depth N" sets time_limit=None and searches to that depth.
+  - "go movetime MS" sets a time limit in seconds.
+  - The engine prints "info depth ..." messages during search when log=True.
+
+This is intentionally minimal but functional enough to plug into UCI GUIs.
+
+
+Tests and What They Prove
+-------------------------
+Implementation: tests\
+
+tests\test_perft.py
+  - Verifies leaf counts for:
+    - Start position (20, 400, 8902)
+    - Kiwipete (48, 2039, 97862)
+    - A known endgame position (14, 191, 2812)
+  These positions stress:
+    - castling legality and rook movement
+    - pinned pieces
+    - en passant generation and legality
+    - promotions and general sliding/jumping correctness
+
+tests\test_rules.py
+  - FEN round-trip (parse then print equals original).
+  - Castling moves rook and clears rights.
+  - Castling through attacked squares is illegal.
+  - En passant capture removes the correct pawn.
+  - En passant discovered-check illegality is rejected.
+  - Promotions generate 4 choices and place correct promoted piece.
+  - Checkmate and stalemate detection correctness.
+  - Threefold repetition detection via knight shuffling.
+  - 50-move rule detection when halfmove_clock>=100.
+
+tests\test_search.py
+  - Search returns a move that is in legal_moves() (no illegal AI output).
+  - Search returns None in terminal checkmate position.
+
+
+Performance Notes (What Was Done and Why)
+-----------------------------------------
+This engine aims to be correct first, but several practical optimizations are in place:
+
+1) Immutable tuples for boards:
+   - Board stored as tuple[int] prevents accidental mutation.
+
+2) Trusted transient positions:
+   - For legality filtering/perft/search internals, Position._trusted can create
+     a position without re-running full __post_init__ validation.
+   - This reduces overhead significantly in perft.
+
+3) Reduced hashing/history in hot paths:
+   - Perft uses unchecked transitions with compute_hash=False and record_history=False.
+   - This avoids unnecessary hashing and history growth in perft recursion.
+
+4) Deterministic TT:
+   - Transposition table reduces node counts.
+
+Important correctness constraint:
+  - Any time the TT is used, the position must have a correct zobrist_hash.
+  - Therefore, search uses Position.make_move(... record_history=False) for nodes (it computes hash),
+    and uses the unchecked path only where TT/hashing isn't required.
+
+
+Running the Program (Practical)
+------------------------------
+Because "python" is not on PATH in your PowerShell session, use the bundled python:
+
+  cd "C:\Users\shehe\OneDrive\Documents\New project"
+  & "C:\Users\shehe\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m chessforge.cli
+
+Make a move:
+  - At the prompt, type a move like: e2e4
+  - For promotion: e7e8q
+
+Run tests:
+  & "C:\Users\shehe\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m unittest discover -s tests -v
+
+Run UCI:
+  & "C:\Users\shehe\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m chessforge.uci
+
+
+Concept Inventory (Explicit List)
+---------------------------------
+This section lists the concepts actually used in the implementation (not hypothetical extras):
+
+Data modeling:
+  - Immutable dataclasses (Position, Move, SearchConfig, SearchResult, GameStatus)
+  - Signed integer piece encoding (color+type)
+  - Tuple-based immutable board storage
+  - Stack-based undo in CLI
+
+Chess rules:
+  - FEN parsing/printing (6-field)
+  - Legal move generation via king-safety filtering
+  - Castling rights tracking and path attack checks
+  - En passant target tracking and correct capture resolution
+  - Promotion generation (all 4 options)
+  - Check/checkmate/stalemate logic
+  - Threefold repetition via zobrist history
+  - 50-move rule via halfmove clock
+  - Insufficient material detection (common cases)
+
+Algorithms and math:
+  - Ray tracing for sliding attacks/moves (bishop/rook/queen)
+  - Delta-based move generation for knights/kings (vector offsets)
+  - Matrix-based piece-square tables (8x8 matrices)
+  - Linear interpolation between two king PST matrices based on endgame weighting
+  - Basic mobility metric
+  - Negamax minimax
+  - Alpha-beta pruning
+  - Quiescence search
+  - Transposition table with bound flags (EXACT/LOWER/UPPER)
+  - Zobrist hashing (XOR-based, deterministic random keys)
+  - SplitMix64-based deterministic pseudorandom key generation
+
+Engineering concerns:
+  - Determinism (no randomness in play results given same settings)
+  - Defensive validation for public APIs (illegal moves raise clear errors)
+  - Regression testing with perft
+  - Clean separation: core rules vs eval vs search vs interfaces
+
+
+How To Read The Code (Suggested Walk Order)
+-------------------------------------------
+1) chessforge\constants.py
+   - Understand indexing, piece codes, and castling bits.
+
+2) chessforge\move.py
+   - Understand Move and UCI formatting.
+
+3) chessforge\core.py
+   - Read Position.from_fen/to_fen first.
+   - Then is_square_attacked (attack detection).
+   - Then pseudo-legal generation helpers and legal_moves filtering.
+   - Then make_move/_make_move_unchecked transition logic.
+   - Then status() and perft.
+
+4) chessforge\evaluation.py
+   - Understand material + PST matrices + king PST blending.
+
+5) chessforge\search.py
+   - Read SearchEngine.search (iterative deepening).
+   - Then _negamax (alpha-beta + TT).
+   - Then _quiescence and _ordered_moves.
+
+6) chessforge\cli.py and chessforge\uci.py
+   - Understand how user input and UCI commands drive Position + SearchEngine.
+
+7) tests\*
+   - See which behaviors are pinned down by regression tests.
+
+End of DEEP_DIVE.txt
