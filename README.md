@@ -13,7 +13,6 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-00d4aa?style=flat-square)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-00d4aa?style=flat-square)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 [![Stars](https://img.shields.io/github/stars/ibnshafi/chessforge?style=flat-square&color=yellow)](https://github.com/ibnshafi/chessforge/stargazers)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen?style=flat-square)]()
