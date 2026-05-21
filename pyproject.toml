@@ -9,7 +9,7 @@ description = "A from-scratch chess rules engine, search engine, CLI, and UCI in
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "ChessForge" }]
-license = { text = "MIT" }
+license = { text = "ibnshafi" }
 
 [project.scripts]
 chessforge = "chessforge.cli:main"
