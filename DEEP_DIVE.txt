@@ -1,9 +1,5 @@
 ChessForge Deep Dive (No External Chess Libraries)
-==================================================
-
-Location
---------
-Project root: C:\Users\shehe\OneDrive\Documents\New project\
+============================================
 
 Purpose
 -------
